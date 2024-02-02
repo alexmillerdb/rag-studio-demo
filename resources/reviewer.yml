@@ -1,0 +1,20 @@
+targets:
+  reviewers:
+    resources:
+      jobs:
+        # Override the common start_review job instead of the default
+        start_review:
+          job_clusters:
+            - job_cluster_key: start_review_job_cluster
+              # override the compute cluster to use larger cluster vs the default
+              new_cluster:
+                node_type_id: i3.xlarge
+                spark_version: 13.3.x-cpu-ml-scala2.12
+                autoscale:
+                  min_workers: 1
+                  max_workers: 5
+          run_as: 
+            # for non-dev environment, use service principal instead of individual user names
+            # TODO: create a service principal
+            #service_principal_name: "RAG_REVIEWER"
+            user_name: ${workspace.current_user.userName}

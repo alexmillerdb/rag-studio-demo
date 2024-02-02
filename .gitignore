@@ -1,0 +1,3 @@
+.databricks
+# snapshot config files will not be version controlled
+.config-snapshot

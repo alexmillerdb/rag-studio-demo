@@ -1,0 +1,92 @@
+# WARNING: do not update the common notebook parameters directly, they are managed by the RAG CLI
+common_notebook_params: &common_notebook_params
+  environment: ${bundle.target}
+  config_root: ${workspace.root_path}/files/config
+  config_file: ${var.config_file}
+
+targets:
+  dev:
+    resources:
+      jobs:
+        # Ingest raw data into the Unity Catalog from the data source
+        ingest_data:
+          name: "[rag-studio-demo][${bundle.target}] ingest_data"
+          tasks:
+            - task_key: ingest_data_task
+              job_cluster_key: ingest_data_job_cluster
+              notebook_task:
+                notebook_path: ../src/notebooks/ingest_data.py
+                base_parameters:
+                  <<: *common_notebook_params
+                  owner: ${workspace.current_user.userName}
+          job_clusters:
+            - job_cluster_key: ingest_data_job_cluster
+              new_cluster:
+                node_type_id: i3.xlarge
+                spark_version: 13.3.x-cpu-ml-scala2.12
+                autoscale:
+                  min_workers: 1
+                  max_workers: 2
+          run_as:
+            user_name: ${workspace.current_user.userName}
+        create_rag_version:
+          name: "[rag-studio-demo][${bundle.target}] create_rag_version"
+          tasks:
+            - task_key: env_setup_task
+              job_cluster_key: create_rag_version_job_cluster
+              notebook_task:
+                notebook_path: ../src/notebooks/env_setup.py
+                base_parameters:
+                  <<: *common_notebook_params
+                  owner: ${workspace.current_user.userName}
+
+            # This task creates a new version of the RAG application by creating a new experiment run
+            - task_key: create_rag_version_task
+              job_cluster_key: create_rag_version_job_cluster
+              depends_on:
+                - task_key: env_setup_task
+              notebook_task:
+                notebook_path: ../src/notebooks/create_rag_version.py
+                base_parameters:
+                  <<: *common_notebook_params
+
+            # Processes the knowledge base data from the raw data source, computes the embeddings and push them to a vector search index so that they can be retrieved
+            # via the vector search endpoint
+            - task_key: process_data_task
+              job_cluster_key: create_rag_version_job_cluster
+              depends_on:
+                - task_key: create_rag_version_task
+              notebook_task:
+                notebook_path: ../src/notebooks/process_data.py
+                base_parameters:
+                  <<: *common_notebook_params
+
+            # Builds the chain model by wiring up the vector search endpoint to the chain model, logs the chain model and creates a new model version for this experiment
+            - task_key: build_chain_task
+              job_cluster_key: create_rag_version_job_cluster
+              depends_on:
+                - task_key: create_rag_version_task
+              notebook_task:
+                notebook_path: ../src/notebooks/build_chain.py
+                base_parameters:
+                  <<: *common_notebook_params
+
+            # Deploys the chain model version to the model serving endpoint to be served
+            - task_key: deploy_chain_task
+              job_cluster_key: create_rag_version_job_cluster
+              depends_on:
+                - task_key: build_chain_task
+              notebook_task:
+                notebook_path: ../src/notebooks/deploy_chain.py
+                base_parameters:
+                  <<: *common_notebook_params
+
+          job_clusters:
+            - job_cluster_key: create_rag_version_job_cluster
+              new_cluster:
+                node_type_id: i3.xlarge
+                spark_version: 13.3.x-cpu-ml-scala2.12
+                autoscale:
+                  min_workers: 1
+                  max_workers: 2
+

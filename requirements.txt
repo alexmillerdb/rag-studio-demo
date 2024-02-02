@@ -1,0 +1,2 @@
+click
+https://ml-team-public-read.s3.us-west-2.amazonaws.com/wheels/rag-studio/ed24b030-3c87-40b1-b04c-bb1977254aa3/databricks_rag-0.0.0a1-py3-none-any.whl

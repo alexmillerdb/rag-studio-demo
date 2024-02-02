@@ -1,0 +1,594 @@
+#!/usr/bin/env python
+# WARNING: this utility is internal to RAG studio and should not be modified!
+
+import click
+import subprocess
+import random
+import string
+import os
+import shutil
+from typing import List, Optional, Tuple, Union
+
+import mlflow
+
+from databricks.rag import configs, constants, environments
+from databricks.rag.utils import mlflow as mlflow_utils
+
+
+CONFIG_SNAPSHOT_FOLDER = ".config-snapshot"
+CONFIG_FOLDER = "./config"
+CONFIG_FILE = "rag-config.yml"
+
+
+def _generate_random_string(length=6):
+    """generate a random alphanumeric string of a certain length"""
+    return "".join(random.choices(string.ascii_uppercase + string.digits, k=length))
+
+
+# add type hints below
+def _copy_and_add_suffix(src: str, dst: str):
+    """
+    Copy the source file to the destination directory and save it with a unique suffix
+    :param src: source file path
+    :param dst: destination directory
+    :return: the full path of the new snapshot file
+    """
+    if not os.path.exists(dst):
+        os.makedirs(dst)
+
+    shutil.copy(src, dst)
+    file_name = os.path.basename(src)
+    new_file_name = (
+        file_name.split(".")[0]
+        + "-"
+        + _generate_random_string()
+        + "."
+        + file_name.split(".")[1]
+    )
+    os.rename(dst + "/" + file_name, dst + "/" + new_file_name)
+    # make the new snapshot file readonly
+    os.chmod(dst + "/" + new_file_name, 0o444)
+    # return the full path of the new snapshot file
+    return new_file_name
+
+
+def _validate_and_deploy_bundle(
+    env: str, workspace_root=None, cluster_id_override=None, force_lock=False
+):
+    """
+    Validate and deploy the bundle using the databricks bundle CLI
+    :param env: the environment to deploy the bundle to
+    :param cluster_id_override: the cluster id to use if provided
+    :param force_lock: whether to force lock the deployment
+    :return: the full path of the new snapshot file
+    """
+    snapshot_config_file = _copy_and_add_suffix(
+        f"{CONFIG_FOLDER}/{CONFIG_FILE}", CONFIG_SNAPSHOT_FOLDER
+    )
+
+    # resolve the cluster id from either the config file or the command line argument
+    cluster_id = _resolve_cluster_id(
+        env, CONFIG_SNAPSHOT_FOLDER, snapshot_config_file, cluster_id_override
+    )
+
+    validate_command = ["databricks", "bundle", "validate", "-t", env]
+    if workspace_root:
+        validate_command += [
+            "--var=" + _get_workspace_root_var_name(env) + "=" + workspace_root
+        ]
+
+    _run_command(validate_command)
+
+    # subprocess.run() does not create a newline after every command, fix it
+    deploy_command = ["databricks", "bundle", "deploy", "-t", env]
+    if cluster_id:
+        deploy_command += ["-c", cluster_id]
+
+    if workspace_root:
+        deploy_command += [
+            "--var=" + _get_workspace_root_var_name(env) + "=" + workspace_root
+        ]
+
+    # always force acquire the lock in non-production environments since there dev environments are isolated for each developer
+    if force_lock or env not in {
+        constants.EnvironmentName.REVIEWERS,
+        constants.EnvironmentName.END_USERS,
+    }:
+        deploy_command += ["--force-lock"]
+
+    _run_command(deploy_command)
+
+    return snapshot_config_file
+
+
+def _get_workspace_root_var_name(env: str):
+    return f"{env}_workspace_folder"
+
+
+def _run_command(command: Union[str, List[str]]):
+    """
+    Run a command using the subprocess module and prints out the command that was ran
+    :param command: the command to run
+    """
+    # TODO: consider moving the command printing to debug mode and avoid exposing the low level details to the user by default
+    # echo the command that is being run in green
+    click.echo(click.style("\nRunning: " + " ".join(command), fg="green"))
+    subprocess.run(command, check=True)
+
+
+def _run_bundle_job(
+    env,
+    job_name,
+    notebook_param_list=[],
+    cluster_id=None,
+    rag_wheel=None,
+    force_lock=False,
+):
+    """
+    Run a job that is deployed onto the target environment.  It will perform the common steps:
+    1. Validate and deploy the bundle
+    2. Apply the common config file and config root overrides as notebook params
+    3. Add any additional job specific notebook params
+    4. Resolve the workspace root and add it as a notebook param
+    5. Apply the rag_wheel and cluster_id overrides as notebook params
+    6. Invoke the final bundle run command for the target job
+
+    :param env: the environment to run the bundle job on
+    :param job_name: the name of the bundle job to run
+    :param notebook_param_list: the list of the notebook parameters to pass to the bundle job. It is not always possible
+                                to encode all params in to a single --notebook-params to the bundle due to escaping rules,
+                                therefore pass in as separate items in a list
+    """
+    workspace_root = _get_workspace_root(env, CONFIG_FOLDER, CONFIG_FILE)
+    bundle_run_cmd = ["databricks", "bundle", "run", "-t", env, job_name]
+
+    snapshot_config_file = _validate_and_deploy_bundle(
+        env,
+        workspace_root=workspace_root,
+        cluster_id_override=cluster_id,
+        force_lock=force_lock,
+    )
+
+    # Override both the config root and config file as notebook params so that they are consistent with the
+    # workspace root
+    notebook_params = {"config_root": f"{workspace_root}/files/{CONFIG_SNAPSHOT_FOLDER}"}
+    notebook_params |= {"config_file": snapshot_config_file}
+
+    if rag_wheel:
+        notebook_params = _add_optional_rag_wheel_param(notebook_params, rag_wheel)
+
+    bundle_run_cmd += ["--notebook-params", _to_notebook_params_string(notebook_params)]
+
+    if workspace_root:
+        bundle_run_cmd += [
+            "--var=" + _get_workspace_root_var_name(env) + "=" + workspace_root
+        ]
+
+    for notebook_params in notebook_param_list:
+        bundle_run_cmd += [
+            "--notebook-params",
+            _to_notebook_params_string(notebook_params),
+        ]
+
+    _run_command(bundle_run_cmd)
+
+
+def _to_notebook_params_string(params):
+    """
+    Convert a dictionary to a string of notebook parameters
+    :param params: a dictionary of notebook parameters
+    Example: {'version': 10, 'config_file': 'rag-config-7MBRQD.yml'} => 'version=10,config_file=rag-config-7MBRQD.yml'
+    """
+    return ",".join([str(k) + "=" + str(v) for k, v in params.items()])
+
+
+def _add_optional_rag_wheel_param(params, rag_wheel: str):
+    """
+    Add the optional rag_wheel parameter to a set of notebook parameters
+    """
+    if rag_wheel:
+        params |= {"rag_wheel_path": rag_wheel}
+    return params
+
+
+def _setup_env(env: str, rag_wheel=None, cluster_id=None, force_lock=False):
+    """
+    Runs the setup job for a given environment
+    :param env: the target environment to run the setup job
+    """
+    _run_bundle_job(
+        env, job_name="env_setup", cluster_id=cluster_id, rag_wheel=rag_wheel
+    )
+
+
+def _get_chain_model_uris(versions: str, config_root: str, config_file: str) -> List:
+    """
+    Get the URI of the chain model for a given version
+    :param env: the environment to get the chain model URI from
+    :param version: the version of the chain model to get the URI for
+    """
+    extended_config = configs.DefaultExtendedConfig(config_root, config_file)
+    model_name = environments.get_model_name(extended_config.input_config)
+    model_uris = []
+    # return the model URI for each version in the list of versions
+    for version in set(versions):
+        model_uris.append(mlflow_utils.get_model_uri(model_name, version))
+    return model_uris
+
+
+def _resolve_cluster_id(
+    env: str, config_root: str, config_file: str, cluster_id_override=None
+):
+    """
+    Resolve the cluster id (if provided) to use either from the config files from if an override is provided
+    :param env: the environment to get the cluster id from
+    :param config_root: the root folder of the config file
+    :param config_file: the config file name
+    :param cluster_id_override: the cluster id to use if provided
+    """
+    if cluster_id_override is not None:
+        return cluster_id_override
+
+    config = configs.DefaultExtendedConfig(config_root, config_file)
+    development_infos = config.input_config.environment_config.development
+
+    # Find the instance of DeveloperEnvironmentInfo from development_infos that matches the dev env name
+    for development_info in development_infos:
+        if development_info.name == env:
+            return (
+                development_info.cluster_id.strip()
+                if development_info.cluster_id is not None
+                else None
+            )
+    return None
+
+
+def _get_workspace_root(env: str, config_root: str, config_file: str):
+    """
+    Get the workspace root for a given environment from the config file
+    :param env: the environment to get the workspace path from
+    :param config_root: the root folder of the config file
+    :param config_file: the config file name
+    """
+    config = configs.DefaultExtendedConfig(config_root, config_file)
+    if env == constants.EnvironmentName.REVIEWERS:
+        return config.input_config.environment_config.reviewers.workspace_folder
+    elif env == constants.EnvironmentName.END_USERS:
+        return config.input_config.environment_config.end_users.workspace_folder
+    else:
+        development_infos = config.input_config.environment_config.development
+        for development_info in development_infos:
+            if development_info.name == env:
+                return development_info.workspace_folder
+    return None
+
+
+# TODO (vperiyasamy): move the derivation of the assessment and request log table names to databricks.rag.utils
+def _get_log_table_names(
+    env: str, eval_table_name: Optional[str], config_root: str, config_file: str, profile=None
+) -> Tuple[str, str]:
+    """
+    Get the table names for the request and assessment logs, depending on the given eval_table_name or environment.
+    :param env: The environment to get the table names from, if eval_table_name is None
+    :param eval_table_name: The eval dataset to get the table names from. If omitted, the table names will be
+                            derived from the environment config.
+    :param config_root: The config root path to parse the config, if eval_table_name is None
+    :param config_file: The config file path to parse the config, if eval_table_name is None
+    :return:
+    """
+    if eval_table_name is None:
+        # Derive the table names for the online request and assessment logs
+        # Note that we need to set the MLflow tracking URI in order to read the experiment tag.
+        if profile is not None:
+            # Explicitly set the Mlflow tracking URI to the Databricks profile
+            mlflow.set_tracking_uri(f"databricks://{profile}")
+        else:
+            # if no profiles are provided, use the default profile
+            mlflow.set_tracking_uri("databricks")
+
+        extended_config = configs.DefaultExtendedConfig(
+            config_root, config_file, env
+        )
+        request_log_table = extended_config.deployed_environment_info.request_log_table
+        assessment_log_table = (
+            extended_config.deployed_environment_info.assessment_log_table
+        )
+    else:
+        request_log_table = f"{eval_table_name}_request_log"
+        assessment_log_table = f"{eval_table_name}_assessment_log"
+
+    return request_log_table, assessment_log_table
+
+
+# Main command group
+@click.group(context_settings=dict(help_option_names=["-h", "--help"]))
+def cli():
+    pass
+
+
+# The optional parameter to specify a path to the wheel file
+def rag_wheel_param(f):
+    f = click.option(
+        "--rag-wheel", hidden=True, default=None, help="Path to a custom RAG wheel file"
+    )(f)
+    return f
+
+
+def env_param(f):
+    f = click.option(
+        "-e",
+        "--env",
+        required=True,
+        help="The target environment (dev, reviewers, end_users) to run the command against",
+    )(f)
+    return f
+
+
+# The optional parameter to a cluster to use for running the jobs
+def cluster_id_param(f):
+    f = click.option(
+        "-c",
+        "--cluster-id",
+        default=None,
+        help="(Dev environment only) An existing cluster to use when running jobs",
+    )(f)
+    return f
+
+
+# The optional parameter to force acuiqre the bundle deployment lock in case it was not released properly
+def force_lock_param(f):
+    f = click.option(
+        "--force-lock",
+        is_flag=True,
+        default=False,
+        hidden=True,
+        help="Force acquisition of databricks bundle deployment lock in case it was not released properly (Always set for dev environment).",
+    )(f)
+    return f
+
+
+# TODO: Add support to clean up all resources both locally and on the workspace
+@cli.command(help="Delete all resources", hidden=True)
+def clean():
+    """
+    clean command that deletes all snapshots from CONFIG_SNAPSHOT_FOLDER
+    """
+    # print out all files to be deleted
+    click.echo("Deleting the following files:")
+    for file in os.listdir(CONFIG_SNAPSHOT_FOLDER):
+        click.echo(file)
+
+    if os.path.exists(CONFIG_SNAPSHOT_FOLDER):
+        shutil.rmtree(CONFIG_SNAPSHOT_FOLDER)
+
+    os.makedirs(CONFIG_SNAPSHOT_FOLDER)
+    click.echo("Cleaned up all snapshots")
+
+
+@cli.command(help="(Dev environment only) Ingest raw data from data source")
+@env_param
+@rag_wheel_param
+@cluster_id_param
+@force_lock_param
+def ingest_data(env, rag_wheel=None, cluster_id=None, force_lock=False):
+    _run_bundle_job(
+        env,
+        job_name="ingest_data",
+        rag_wheel=rag_wheel,
+        cluster_id=cluster_id,
+        force_lock=force_lock,
+    )
+
+
+@cli.command(help="Create and deploy a new version of the RAG chain application")
+@env_param
+@rag_wheel_param
+@cluster_id_param
+@force_lock_param
+def create_rag_version(env, rag_wheel=None, cluster_id=None, force_lock=False):
+    _run_bundle_job(
+        env,
+        job_name="create_rag_version",
+        rag_wheel=rag_wheel,
+        cluster_id=cluster_id,
+        force_lock=force_lock,
+    )
+    # TODO resume the online unpacking job if it's in dev
+
+
+@cli.command(help="Deploy the chain model for a given RAG version")
+@env_param
+@click.option(
+    "-v",
+    "--version",
+    required=True,
+    help="The version number (e.g. 5) of the RAG application to deploy",
+)
+@rag_wheel_param
+@cluster_id_param
+@force_lock_param
+def deploy_chain(env, version, rag_wheel=None, cluster_id=None, force_lock=False):
+    notebook_params = {"version": version}
+    _run_bundle_job(
+        env,
+        job_name="deploy_chain",
+        notebook_param_list=[notebook_params],
+        rag_wheel=rag_wheel,
+        cluster_id=cluster_id,
+        force_lock=force_lock,
+    )
+
+
+@cli.command(
+    help="Run offline evaluation for a given chain version and evaluation dataset"
+)
+@env_param
+@click.option(
+    "-v",
+    "--version",
+    required=True,
+    help="The version of the chain model to run evaluation on",
+)
+@click.option(
+    "-t", "--eval-table-name", help="The dataset to run the evaluation against"
+)
+@rag_wheel_param
+@cluster_id_param
+@force_lock_param
+def run_offline_eval(
+    env, version, eval_table_name, rag_wheel=None, cluster_id=None, force_lock=False
+):
+    notebook_params = {
+        "version": version,
+        "eval_dataset": eval_table_name,
+    }
+    _run_bundle_job(
+        env,
+        job_name="run_offline_eval",
+        notebook_param_list=[notebook_params],
+        rag_wheel=rag_wheel,
+        cluster_id=cluster_id,
+        force_lock=force_lock,
+    )
+
+
+@cli.command(
+    help="Run online evaluation on the currently-logged requests from the scoring endpoint"
+)
+@env_param
+@rag_wheel_param
+@cluster_id_param
+@force_lock_param
+def run_online_eval(env, rag_wheel=None, cluster_id=None, force_lock=False):
+    click.echo(
+        "\nNote: it may be possible that some results do not appear after running this command, as it can take up to 10 minutes for logs to be generated from the chain model endpoint."
+    )
+    if env in {
+        constants.EnvironmentName.REVIEWERS,
+        constants.EnvironmentName.END_USERS,
+    }:
+        click.echo(
+            f"Note: running online evaluation in the {constants.EnvironmentName.REVIEWERS} or {constants.EnvironmentName.END_USERS} environment is not required, as the underlying workflows already run on a schedule."
+        )
+    _run_bundle_job(
+        env,
+        job_name="run_online_eval",
+        rag_wheel=rag_wheel,
+        cluster_id=cluster_id,
+        force_lock=force_lock,
+    )
+
+
+@cli.command(help="Run the exploration notebook on the evaluation results")
+@env_param
+@click.option(
+    "-t",
+    "--eval-table-name",
+    help="The dataset that the evaluation was performed on for which to explore offline results. Omit this parameter to explore results for online logs in the provided environment.",
+)
+@click.option(
+    "-v",
+    "--versions",
+    default="*",
+    help="The version to compare and evaluate the results against. Use `*` to compare against all versions",
+)
+# TODO: consider extending -p to other RAG commands or reverse lookup the profile from the workspace host so that it is consistent the databricks bundle approach
+@click.option(
+    "-p",
+    "--profile",
+    hidden=True,
+    default=None,
+    help="The databricks CLI profile to use to fetch the eval metadata. This must match the profile used to create the local RAG workspace. If omitted, the default profile will be used."
+)
+@rag_wheel_param
+@cluster_id_param
+@force_lock_param
+def explore_eval(
+    env, eval_table_name, versions, profile, rag_wheel=None, cluster_id=None, force_lock=False
+):
+    request_log_table_name, assessment_log_table_name = _get_log_table_names(
+        env, eval_table_name, CONFIG_FOLDER, CONFIG_FILE, profile
+    )
+    log_table_params = _add_optional_rag_wheel_param(
+        {
+            "assessment_log_table_name": assessment_log_table_name,
+            "request_log_table_name": request_log_table_name,
+        },
+        rag_wheel,
+    )
+    model_version_uris = (
+        ",".join(_get_chain_model_uris(versions.split(","), CONFIG_FOLDER, CONFIG_FILE))
+        if versions != "*"
+        else "*"
+    )
+
+    # the model uris for each version are passed down as versions parameter to the notebook
+    versions_params = {"versions": model_version_uris}
+
+    _run_bundle_job(
+        env,
+        job_name="explore_eval",
+        notebook_param_list=[log_table_params, versions_params],
+        rag_wheel=rag_wheel,
+        cluster_id=cluster_id,
+        force_lock=force_lock,
+    )
+
+
+@cli.command(help="Start the review process for a given chain model version")
+@env_param
+@click.option(
+    "-v",
+    "--version",
+    required=True,
+    help="The version of the chain model to run evaluation on",
+)
+@click.option(
+    "-t",
+    "--review-request-table",
+    required=True,
+    help="The name of table that contains the review requests",
+)
+@rag_wheel_param
+@cluster_id_param
+@force_lock_param
+def start_review(
+    env,
+    version,
+    review_request_table,
+    rag_wheel=None,
+    cluster_id=None,
+    force_lock=False,
+):
+    notebook_params = {
+        "version": version,
+        "review_request_table": review_request_table,
+    }
+    _run_bundle_job(
+        env,
+        job_name="start_review",
+        notebook_param_list=[notebook_params],
+        rag_wheel=rag_wheel,
+        cluster_id=cluster_id,
+        force_lock=force_lock,
+    )
+
+
+# TODO: check that the security scope and key are filled out in the config
+@cli.command(
+    help=f"Set up the {constants.EnvironmentName.REVIEWERS} and {constants.EnvironmentName.END_USERS} environments"
+)
+@rag_wheel_param
+@cluster_id_param
+@force_lock_param
+def setup_prod_env(rag_wheel=None, cluster_id=None, force_lock=False):
+    _setup_env(
+        constants.EnvironmentName.REVIEWERS, rag_wheel, cluster_id, force_lock
+    )
+    _setup_env(
+        constants.EnvironmentName.END_USERS, rag_wheel, cluster_id, force_lock
+    )
+
+
+if __name__ == "__main__":
+    cli()

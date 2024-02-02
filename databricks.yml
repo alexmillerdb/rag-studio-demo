@@ -1,0 +1,55 @@
+# This is a Databricks asset bundle definition for rag_demo.
+# See https://docs.databricks.com/dev-tools/bundles/index.html for documentation.
+bundle:
+  name: rag-studio-demo
+
+include:
+  - config/*.yml
+  - resources/shared.yml
+  - resources/dev.yml
+  - resources/reviewer.yml
+  - resources/end_user.yml
+
+sync:
+  include:
+    - .config-snapshot/*.yml # .config-snapshot is in .gitignore since they will not be checked in so by default they are not synced to the databricks workspace, force it to be synced
+
+workspace:
+  host: https://e2-demo-field-eng.cloud.databricks.com
+
+# These variables should be part of bundle init 
+variables:
+  config_file: 
+    description: The path to the configuration file for the RAG application, environment and its components
+    default: rag-config.yml
+  dev_workspace_folder:
+    description: The target workspace folder for the dev target
+    default: /Workspace/Users/alex.miller@databricks.com/rag_studio/rag-studio-demo/dev
+  reviewers_workspace_folder:
+    description: The target workspace folder for the reviewers target
+    # for non "development" mode targets, bundle validate fails when root_path contains the current user name
+    default: /Workspace/Shared/rag_studio/rag-studio-demo/reviewers
+  end_users_workspace_folder:
+    description: The target workspace folder for the end_users target
+    # for non "development" mode targets, bundle validate fails when root_path contains the current user name
+    default: /Workspace/Shared/rag_studio/rag-studio-demo/end_users
+
+
+targets:
+  dev: 
+    mode: development
+    default: true
+    workspace:
+      root_path: ${var.dev_workspace_folder}
+  
+  reviewers: 
+    mode: production
+    workspace:
+      root_path: ${var.reviewers_workspace_folder}
+      host: https://e2-demo-field-eng.cloud.databricks.com
+  
+  end_users: 
+    mode: production
+    workspace:
+      root_path: ${var.end_users_workspace_folder}
+      host: https://e2-demo-field-eng.cloud.databricks.com

@@ -1,0 +1,129 @@
+# WARNING: do not update the common notebook parameters directly, they are managed by the RAG CLI
+common_notebook_params: &common_notebook_params
+  environment: ${bundle.target}
+  config_root: ${workspace.root_path}/files/config
+  config_file: ${var.config_file}
+
+default_job_cluster: &default_job_cluster
+  new_cluster:
+    node_type_id: i3.xlarge
+    spark_version: 13.3.x-cpu-ml-scala2.12
+    autoscale:
+      min_workers: 1
+      max_workers: 2
+
+# Common resources across all environments
+resources:
+  jobs:
+    # sets up the environment for the RAG application in an idempotent way.  This includes any resources that are not created as part of bundle deploy that are not supported.
+    env_setup:
+      name: "[rag-studio-demo][${bundle.target}] env_setup"
+      tasks:
+        - task_key: env_setup_task
+          job_cluster_key: env_setup_job_cluster
+          notebook_task:
+            notebook_path: ../src/notebooks/env_setup.py
+            base_parameters:
+              <<: *common_notebook_params
+              owner: ${workspace.current_user.userName}
+      job_clusters:
+        - job_cluster_key: env_setup_job_cluster
+          <<: *default_job_cluster
+      run_as:
+        user_name: ${workspace.current_user.userName}
+
+    # kick off a review on a deployed chain model
+    start_review:
+      name: "[rag-studio-demo][${bundle.target}] start_review"
+      tasks:
+        - task_key: start_review_task
+          job_cluster_key: start_review_job_cluster
+          notebook_task:
+            notebook_path: ../src/notebooks/start_review.py
+            base_parameters:
+              <<: *common_notebook_params
+              version: ""
+              review_request_table: ""
+      job_clusters:
+        - job_cluster_key: start_review_job_cluster
+          <<: *default_job_cluster
+      run_as:
+        user_name: ${workspace.current_user.userName}
+
+    # Deploys a new model version to the chain endpoint
+    deploy_chain:
+      name: "[rag-studio-demo][${bundle.target}] deploy_chain"
+      tasks:
+        - task_key: deploy_chain_task
+          job_cluster_key: deploy_chain_job_cluster
+          notebook_task:
+            notebook_path: ../src/notebooks/deploy_chain.py
+            base_parameters:
+              <<: *common_notebook_params
+              version: ""
+      job_clusters:
+        - job_cluster_key: deploy_chain_job_cluster
+          <<: *default_job_cluster
+      run_as:
+        user_name: ${workspace.current_user.userName}
+
+    # Polls data from the inference table and generates the request and assessment logs used for online eval
+    run_online_eval:
+      name: "[rag-studio-demo][${bundle.target}] run_online_eval"
+      tasks:
+        - task_key: run_online_eval_task
+          job_cluster_key: run_online_eval_job_cluster
+          notebook_task:
+            notebook_path: ../src/notebooks/run_online_eval.py
+            base_parameters:
+              <<: *common_notebook_params
+      job_clusters:
+        - job_cluster_key: run_online_eval_job_cluster
+          <<: *default_job_cluster
+      schedule:
+        # TODO (vperiyasamy): change back to 30 minute schedule before launch!
+        quartz_cron_expression: "26 0/5 * * * ?" # runs every 5 minutes
+        timezone_id: UTC
+      queue:
+        enabled: false # Disable queuing to prevent runs from infinitely building up
+      run_as:
+        user_name: ${workspace.current_user.userName}
+
+    # Kick off offline evaluation for a deployed chain
+    run_offline_eval:
+      name: "[rag-studio-demo][${bundle.target}] run_offline_eval"
+      tasks:
+        - task_key: run_offline_eval_task
+          job_cluster_key: run_eval_job_cluster
+          notebook_task:
+            notebook_path: ../src/notebooks/run_offline_eval.py
+            base_parameters:
+              <<: *common_notebook_params
+              version: ""
+              eval_table_name: ""
+      run_as:
+        user_name: ${workspace.current_user.userName}
+      
+      job_clusters:
+        - job_cluster_key: run_eval_job_cluster
+          <<: *default_job_cluster
+
+    explore_eval:
+      name: "[rag-studio-demo][${bundle.target}] explore_eval"
+      tasks:
+        - task_key: explore_eval_task
+          job_cluster_key: explore_eval_job_cluster
+          notebook_task:
+            # NOTE: this notebook is user visible so it is not in the src/notebooks folder
+            notebook_path: ../src/eval/explore_eval.py
+            base_parameters:
+              <<: *common_notebook_params
+              versions: ""
+              request_log_table_name: ""
+              assessment_log_table_name: ""
+      run_as:
+        user_name: ${workspace.current_user.userName}
+
+      job_clusters:
+        - job_cluster_key: explore_eval_job_cluster
+          <<: *default_job_cluster

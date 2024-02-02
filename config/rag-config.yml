@@ -1,0 +1,130 @@
+global_config:
+    ########
+    # Required, global configuration
+    # These settings are consistent between all Environments
+    ########
+
+    # User provided name of the application.  Only alphanumeric chars, `_`, or `-`; no spaces.
+    name: rag-studio-demo
+
+    # The workspace where the application is deployed
+    workspace_url: https://e2-demo-field-eng.cloud.databricks.com
+
+    # Location used for all assets stored within UC.
+    uc_assets_location:
+        catalog: main
+        schema: rag_studio_demo_alexm
+
+    ########
+    # Optional configuration
+    # If these parameters are not defined, a value will be generated based on the templates indicated below.
+    # {app_generated_6digit_id} is consistent between all ALL environments and will NOT change when you deploy a new version of the <RAG Application>.
+    # <Roadmap> Allow use of {} template strings to customize the naming convention
+    ########
+
+    # Vector Search Endpoint
+    # Default `{name}__vs_endpoint`
+    vector_search_endpoint: rag-studio-demo_vs_endpoint
+
+    # The MLflow Experiment contain the Versions of your <RAG Application>
+    # Default: `/Shared/{name}__experiment/`
+    mlflow_experiment_name: /Shared/rag-studio-demo__experiment
+
+environment_config:
+    end_users:
+        # The folder where the deployed code is written
+        workspace_folder: /Workspace/Shared/rag_studio/rag-studio-demo/end_users
+        security_scope: "abm"
+        security_key: "sp_secret_key"
+
+    reviewers:
+        # The folder where the deployed code is written
+        workspace_folder: /Workspace/Shared/rag_studio/rag-studio-demo/reviewers
+        security_scope: "abm"
+        security_key: "sp_secret_key"
+
+    development:
+        - name: dev
+          # The folder where the deployed code is written
+          workspace_folder: /Workspace/Users/alex.miller@databricks.com/rag_studio/rag-studio-demo/dev
+          security_scope: "abm"
+          security_key: "sp_secret_key"
+          # When specified, re-use an existing compute cluster for all RAG operations.  Otherwise, a new cluster will be created every time but please ensure you have the necessary permissions to create new clusters.
+          cluster_id: ""
+
+evaluation:
+  # Configure the LLM judges for assessments
+  assessment_judges:
+    - judge_name: LLaMa2-70B-Chat
+      endpoint_name: databricks-llama-2-70b-chat # Model Serving endpoint name
+      assessments: # pre-defined list based on the names of metrics
+        - harmful
+        - answer_correct
+        - faithful_to_context
+        - relevant_to_question_and_context
+
+data_ingestors:
+  - name: spark-docs-ingestor
+    description: Ingest Spark docs from the website
+    # Optional. The Unity Catalog Volume where the raw docs are stored. If not specified, will default to `{name}__raw_docs`
+    destination_uc_volume: raw_databricks_docs
+
+data_processors:
+  - name: spark-docs-processor
+    description: Parse, chunk, embed Spark documentation
+    # explicit link to the data ingestors that this processor uses.
+    data_ingestors:
+      - name: spark-docs-ingestor
+    # Optional. The Unity Catalog table where the embedded, chunked docs are stored.
+    # If not specified, will default to `{name}__embedded_docs__{version_number}`
+    # If specified, will default to `{provided_value}__{version_number}`
+    destination_table:
+      name: databricks_docs_chunked
+    destination_vector_index:
+      databricks_vector_search:
+        # Optional. The Unity Catalog table where the embedded, chunked docs are stored.
+        # If not specified, will default to `{name}__embedded_docs_index__{version_number}`
+        # If specified, will default to `{provided_value}__{version_number}`
+        index_name: databricks_docs_index
+    embedding_model:
+      endpoint_name: databricks-bge-large-en
+      instructions:
+        embedding: ""
+        query: "Represent this sentence for searching relevant passages:"
+    # these are key-value pairs that can be specified by the end user
+    configurations:
+      chunk_size: 500
+      chunk_overlap: 50
+
+# jan 12 - the configuration is specified, but its just part of the chain
+retrievers:
+  - name: ann-retriever
+    description: Basic ANN retriever
+    # explicit link to the data processor that this retriever uses.
+    data_processors:
+      - name: spark-docs-processor
+    # these are key-value pairs that can be specified by the end user
+    configurations:
+      k: 5
+      use_mmr: false
+
+chains:
+  - name: spark-docs-chain # User specified, must be unique, no spaces
+    description: Spark docs chain # User specified, any text string
+    # explicit link to the retriever that this chain uses.
+    # currently, only one retriever per chain is supported, but this schema allows support for adding multiple in the future
+    retrievers:
+      - name: ann-retriever
+    foundational_models:
+      - name: llama-2-70b-chat # user specified name to reference this model in the chain & to override per environment. Must be unique.
+        type: v1/llm/chat
+        endpoint_name: databricks-llama-2-70b-chat
+        prompt_template:
+          chat_messages:
+            - role: "system"
+              content: "You are a trustful assistant for Databricks users. You are answering python, coding, SQL, data engineering, spark, data science, AI, ML, Datawarehouse, platform, API or infrastructure, Cloud administration question related to Databricks. If you do not know the answer to a question, you truthfully say you do not know. Read the discussion to get the context of the previous conversation. In the chat discussion, you are referred to as 'system'. The user is referred to as 'user'."
+            - role: "user"
+              content: "Discussion: {chat_history}. Here's some context which might or might not help you answer: {context} Answer straight, do not repeat the question, do not start with something like: the answer to the question, do not add 'AI' in front of your answer, do not say: here is the answer, do not mention the context or the question. Based on this history and context, answer this question: {question}"
+        configurations:
+          temperature: 0.9
+          max_tokens: 200
